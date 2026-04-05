@@ -44,11 +44,6 @@ local hash = ic.hash
 local batch_read_name = ic.batch_read_name
 
 -- ==================== PERSISTENT MEMORY MAP ====================
--- Slots 0-11:   Box 1-12 PA prefab hashes
--- Slots 12-23:  Box 1-12 PA name hashes
--- Slots 24-35:  Box 1-12 label text hashes (legacy)
--- Slots 36-143: Box 1-12 label strings (len + 8 data slots each, 3 chars/slot)
--- Slots 144-145: Max ranges (pressure kPa, volume L)
 
 local MEM_PA_PREFAB_BEGIN = 0
 local MEM_PA_NAMEHASH_BEGIN = 12
@@ -56,6 +51,7 @@ local MEM_LABELHASH_BEGIN = 24
 local MEM_LABELSTR_BEGIN = 36
 local MEM_PRESSURE_MAX = 144
 local MEM_VOLUME_MAX = 145
+local MEM_REFRESH_TICKS = 146
 
 local LABEL_MAX_CHARS = 24
 local LABEL_CHARS_PER_SLOT = 3
@@ -91,6 +87,8 @@ for i = 1, BOX_COUNT do
     pa_dropdown_selected[i] = 0
     pa_dropdown_open[i] = "false"
 end
+
+local cached_tso_dropdowns = nil
 
 -- ==================== COLORS ====================
 
@@ -387,6 +385,23 @@ local function build_filtered_device_options(devices, allowed_prefabs, current_d
     return options, candidates, selected
 end
 
+local function device_list_safe()
+    local ok, result = pcall(device_list)
+    if not ok or result == nil then return {} end
+    return result
+end
+
+local function populate_tso_dropdown_cache()
+    local devs = device_list_safe()
+    cached_tso_dropdowns = {}
+    local allowed = { PA_PREFAB_FILTERS.gas, PA_PREFAB_FILTERS.liquid }
+    for i = 1, BOX_COUNT do
+        local opts, cands, sel = build_filtered_device_options(devs, allowed, pa_devices[i])
+        cached_tso_dropdowns[i] = { opts = opts, candidates = cands, selected = sel }
+        pa_dropdown_selected[i] = sel
+    end
+end
+
 local function refresh_pa_readings()
     for i = 1, BOX_COUNT do
         local device = pa_devices[i]
@@ -451,6 +466,10 @@ local function initialize_settings()
 
     pa_pressure_max_range = sanitize_max_range(read(MEM_PRESSURE_MAX), pa_pressure_max_range)
     pa_volume_max_range = sanitize_max_range(read(MEM_VOLUME_MAX), pa_volume_max_range)
+    local stored_ticks = tonumber(read(MEM_REFRESH_TICKS)) or 0
+    if stored_ticks >= 1 then
+        LIVE_REFRESH_TICKS = math.min(120, stored_ticks)
+    end
 end
 
 -- ==================== RENDER HELPERS ====================
@@ -765,7 +784,6 @@ local function render_settings()
     local panel_h = H - content_y - 22
     local tab_y = panel_y + 8
     local tab_w = math.floor((panel_w - 14) / 2)
-    local devices = device_list() or {}
 
     local function render_settings_subtabs()
         local tabs = {
@@ -879,6 +897,26 @@ local function render_settings()
             end
         })
 
+        s:element({
+            id = "refresh_ticks_label",
+            type = "label",
+            rect = { unit = "px", x = panel_x + 338, y = base_y, w = 44, h = 14 },
+            props = { text = "Ref. Ticks" },
+            style = { font_size = 8, color = C.text, align = "left" }
+        })
+
+        s:element({
+            id = "refresh_ticks_input",
+            type = "textinput",
+            rect = { unit = "px", x = panel_x + 384, y = base_y, w = 40, h = 20 },
+            props = { value = tostring(LIVE_REFRESH_TICKS), placeholder = "6" },
+            on_change = function(new_value)
+                local n = math.max(1, math.min(120, tonumber(new_value) or LIVE_REFRESH_TICKS))
+                LIVE_REFRESH_TICKS = n
+                write(MEM_REFRESH_TICKS, n)
+            end
+        })
+
         local start_idx = pa_settings_page == 1 and 1 or 7
         local end_idx = math.min(start_idx + 5, BOX_COUNT)
 
@@ -888,14 +926,13 @@ local function render_settings()
             local row_y = base_y + 48 + row * 23
             local col_x = panel_x + 14
 
-            local options, candidates, selected_index = build_filtered_device_options(
-                devices,
-                { PA_PREFAB_FILTERS.gas, PA_PREFAB_FILTERS.liquid },
-                pa_devices[idx]
-            )
-            local row_candidates = candidates
-
-            pa_dropdown_selected[idx] = selected_index
+            if cached_tso_dropdowns == nil then
+                populate_tso_dropdown_cache()
+            end
+            local cache_entry = cached_tso_dropdowns[idx] or { opts = { "Select device..." }, candidates = {}, selected = 0 }
+            local options = cache_entry.opts
+            local row_candidates = cache_entry.candidates
+            pa_dropdown_selected[idx] = cache_entry.selected
 
             s:element({
                 id = "pa_" .. i .. "_header",
@@ -915,12 +952,18 @@ local function render_settings()
                     open = pa_dropdown_open[idx],
                 },
                 on_toggle = function()
+                    if cached_tso_dropdowns == nil then
+                        populate_tso_dropdown_cache()
+                    end
                     pa_dropdown_open[idx] = pa_dropdown_open[idx] == "true" and "false" or "true"
                     dashboard_render(true)
                 end,
                 on_change = function(optionIndex)
                     local selected_option = tonumber(optionIndex) or 0
                     pa_dropdown_selected[idx] = selected_option
+                    if cached_tso_dropdowns and cached_tso_dropdowns[idx] then
+                        cached_tso_dropdowns[idx].selected = selected_option
+                    end
                     pa_dropdown_open[idx] = "false"
 
                     if selected_option == 0 then
@@ -1112,6 +1155,7 @@ end
 -- ==================== BOOT ====================
 
 initialize_settings()
+populate_tso_dropdown_cache()
 set_view(view)
 
 -- ==================== MAIN LOOP ====================
