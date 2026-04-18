@@ -52,6 +52,9 @@ local MEM_LABELSTR_BEGIN = 36
 local MEM_PRESSURE_MAX = 144
 local MEM_VOLUME_MAX = 145
 local MEM_REFRESH_TICKS = 146
+local MEM_REG_PREFAB_BEGIN = 147
+local MEM_REG_NAMEHASH_BEGIN = 159
+local MEM_SAFETY_MARGIN = 171
 
 local LABEL_MAX_CHARS = 24
 local LABEL_CHARS_PER_SLOT = 3
@@ -63,15 +66,28 @@ local PA_PREFAB_FILTERS = {
     liquid = hash("StructureLiquidPipeAnalyzer"),
 }
 
+local REG_PREFAB_FILTERS = {
+    vanilla = hash("StructureBackPressureRegulator"),
+    mirrored = hash("StructureBackPressureRegulatorMirrored"),
+    liquid_vanilla = hash("StructureBackLiquidPressureRegulator"),
+    liquid_mirrored = hash("StructureBackLiquidPressureRegulatorMirrored"),
+}
+
+local REG_SETTING_MAX = 60795  -- hardware ceiling for gas back-pressure regulator Setting (kPa)
+local HYSTERESIS_GAP_PCT = 20
+
+local function is_liquid_reg(prefab_hash)
+    local p = tonumber(prefab_hash) or 0
+    return p == REG_PREFAB_FILTERS.liquid_vanilla or p == REG_PREFAB_FILTERS.liquid_mirrored
+end
+
 -- ==================== STATE ====================
 
 local box_labels = {}
 local pa_devices = {}
 local pa_readings = {}
-local pa_dropdown_selected = {}
-local pa_dropdown_open = {}
 local settings_subview = "labels"
-local pa_settings_page = 1
+local pa_picker_idx = nil
 local pa_pressure_max_range = 20000
 local pa_volume_max_range = 1000
 
@@ -84,11 +100,21 @@ for i = 1, BOX_COUNT do
         volume = nil,
         network_fault = nil,
     }
-    pa_dropdown_selected[i] = 0
-    pa_dropdown_open[i] = "false"
 end
 
-local cached_tso_dropdowns = nil
+local reg_devices = {}
+local reg_readings = {}
+local reg_state = {}
+local reg_picker_idx = nil
+local safety_margin_pct = 10
+local reg_on_threshold = 0
+local reg_off_threshold = 0
+
+for i = 1, BOX_COUNT do
+    reg_devices[i] = { prefab = 0, namehash = 0 }
+    reg_readings[i] = { on = nil, ratio = nil, setting = nil, error = nil }
+    reg_state[i] = "off"
+end
 
 -- ==================== COLORS ====================
 
@@ -110,6 +136,46 @@ local C = {
     dark_blue = "#1E3A8A",
     bar_bg = "#1F2937",
 }
+
+-- ==================== UI WRITE CACHE ====================
+
+local _ui_state = setmetatable({}, { __mode = "k" })
+
+local function ui_set_props(h, new_props)
+    if h == nil then return end
+    local s = _ui_state[h]
+    if s == nil then s = { props = {}, style = {} }; _ui_state[h] = s end
+    local changed = false
+    for k, v in pairs(new_props) do
+        if s.props[k] ~= v then
+            s.props[k] = v
+            changed = true
+        end
+    end
+    if changed then
+        h:set_props(new_props)
+    end
+end
+
+local function ui_set_style(h, new_style)
+    if h == nil then return end
+    local s = _ui_state[h]
+    if s == nil then s = { props = {}, style = {} }; _ui_state[h] = s end
+    local changed = false
+    for k, v in pairs(new_style) do
+        if s.style[k] ~= v then
+            s.style[k] = v
+            changed = true
+        end
+    end
+    if changed then
+        h:set_style(new_style)
+    end
+end
+
+local function ui_cache_reset()
+    _ui_state = setmetatable({}, { __mode = "k" })
+end
 
 -- ==================== MEMORY HELPERS ====================
 
@@ -136,6 +202,30 @@ local function safe_batch_read_name(prefab, namehash, logic_type, method)
     end
 
     return batch_read_name(prefab_num, namehash_num, logic_type, method)
+end
+
+local _safe_write_err_state = { last = 0, dropped = 0 }
+
+local function safe_batch_write_name(prefab, namehash, logic_type, value)
+    if ic.batch_write_name == nil then return end
+    if prefab == nil or namehash == nil then return end
+    local prefab_num = tonumber(prefab) or 0
+    local namehash_num = tonumber(namehash) or 0
+    if prefab_num == 0 or namehash_num == 0 then return end
+    local ok, err = xpcall(function()
+        ic.batch_write_name(prefab_num, namehash_num, logic_type, value)
+    end, function(e) return e end)
+    if not ok then
+        local now = util.clock_time() or 0
+        if now - _safe_write_err_state.last >= 1.0 then
+            local dropped = _safe_write_err_state.dropped
+            _safe_write_err_state.last = now
+            _safe_write_err_state.dropped = 0
+            print("safe_batch_write_name error: " .. tostring(err) .. " (dropped " .. dropped .. " since last log)")
+        else
+            _safe_write_err_state.dropped = _safe_write_err_state.dropped + 1
+        end
+    end
 end
 
 -- ==================== HELPERS ====================
@@ -292,6 +382,34 @@ local function save_pa_ranges()
     write(MEM_VOLUME_MAX, pa_volume_max_range)
 end
 
+local function sanitize_safety_margin(value)
+    local n = tonumber(value) or 10
+    if n < 0 then n = 0 end
+    if n > 49 then n = 49 end
+    return math.floor(n + 0.5)
+end
+
+local function recompute_reg_thresholds()
+    local max_p = tonumber(pa_pressure_max_range) or 0
+    local on_pct  = (100 - safety_margin_pct) / 100
+    local off_pct = (100 - safety_margin_pct - HYSTERESIS_GAP_PCT) / 100
+    if off_pct < 0 then off_pct = 0 end
+    reg_on_threshold  = max_p * on_pct
+    reg_off_threshold = max_p * off_pct
+end
+
+local function save_safety_margin()
+    safety_margin_pct = sanitize_safety_margin(safety_margin_pct)
+    write(MEM_SAFETY_MARGIN, safety_margin_pct)
+    recompute_reg_thresholds()
+end
+
+local function save_reg_state(index)
+    if index < 1 or index > BOX_COUNT then return end
+    write(MEM_REG_PREFAB_BEGIN + index - 1, reg_devices[index].prefab)
+    write(MEM_REG_NAMEHASH_BEGIN + index - 1, reg_devices[index].namehash)
+end
+
 local function pressure_value_color(value)
     if value == nil then return C.text_dim end
     local p = bar_percent(value, pa_pressure_max_range)
@@ -343,6 +461,40 @@ local function format_temperature_label(value)
     return fmt(util.temp(value, "K", "C"), 1) .. " C"
 end
 
+local function reg_status_for_box(idx)
+    local reg = reg_devices[idx]
+    local prefab = tonumber(reg and reg.prefab) or 0
+    if reg == nil or prefab == 0 then
+        return "No BPR", C.text_muted
+    end
+    local r = reg_readings[idx] or {}
+    local err = tonumber(r.error) or 0
+    if err >= 1 then
+        return "Error", C.red
+    end
+    local on = tonumber(r.on) or 0
+    if on < 1 then
+        return "Off", C.text_dim
+    end
+    -- Venting iff the paired PA reading has crossed the reg's pinned Setting.
+    -- Gas regs compare pressure vs max kPa; liquid regs compare volume vs max L.
+    local readings = pa_readings[idx] or {}
+    if is_liquid_reg(prefab) then
+        local vol = tonumber(readings.volume)
+        local max_v = tonumber(pa_volume_max_range) or 0
+        if vol ~= nil and max_v > 0 and vol >= max_v then
+            return "Venting", C.orange
+        end
+    else
+        local pressure = tonumber(readings.pressure)
+        local max_p = tonumber(pa_pressure_max_range) or 0
+        if pressure ~= nil and max_p > 0 and pressure >= max_p then
+            return "Venting", C.orange
+        end
+    end
+    return "On", C.green
+end
+
 local function device_matches_prefabs(dev, allowed_prefabs)
     local prefab_hash = tonumber(dev and dev.prefab_hash) or 0
     for _, allowed in ipairs(allowed_prefabs) do
@@ -353,72 +505,130 @@ local function device_matches_prefabs(dev, allowed_prefabs)
     return false
 end
 
-local function build_filtered_device_options(devices, allowed_prefabs, current_device)
-    local options = { "Select device..." }
-    local candidates = {}
-    local selected = 0
-
-    for i, dev in ipairs(devices) do
-        if device_matches_prefabs(dev, allowed_prefabs) then
-            local label = tostring((dev and dev.display_name) or ("Device " .. i))
-            label = label:gsub("|", "/")
-            table.insert(options, label)
-            table.insert(candidates, dev)
-
-            local prefab_hash = tonumber(dev and dev.prefab_hash) or 0
-            local name_hash = tonumber(dev and dev.name_hash) or 0
-            local current_prefab = (current_device.prefab or 0)
-            local current_namehash = (current_device.namehash or 0)
-            if current_prefab ~= 0
-                and current_namehash ~= 0
-                and prefab_hash == current_prefab
-                and name_hash == current_namehash then
-                selected = #candidates
-            end
-        end
-    end
-
-    if #candidates == 0 then
-        options[1] = "No devices found"
-    end
-
-    return options, candidates, selected
-end
-
 local function device_list_safe()
     local ok, result = pcall(device_list)
     if not ok or result == nil then return {} end
     return result
 end
 
-local function populate_tso_dropdown_cache()
-    local devs = device_list_safe()
-    cached_tso_dropdowns = {}
-    local allowed = { PA_PREFAB_FILTERS.gas, PA_PREFAB_FILTERS.liquid }
-    for i = 1, BOX_COUNT do
-        local opts, cands, sel = build_filtered_device_options(devs, allowed, pa_devices[i])
-        cached_tso_dropdowns[i] = { opts = opts, candidates = cands, selected = sel }
-        pa_dropdown_selected[i] = sel
-    end
-end
-
-local function refresh_pa_readings()
+local function refresh_pa_fast()
     for i = 1, BOX_COUNT do
         local device = pa_devices[i]
         local prefab = tonumber(device.prefab) or 0
         local namehash = tonumber(device.namehash) or 0
-
         if prefab ~= 0 and namehash ~= 0 then
-            pa_readings[i].pressure = safe_batch_read_name(prefab, namehash, LT.Pressure, LBM.Average)
-            pa_readings[i].temperature = safe_batch_read_name(prefab, namehash, LT.Temperature, LBM.Average)
-            pa_readings[i].volume = safe_batch_read_name(prefab, namehash, LT.VolumeOfLiquid, LBM.Average)
+            pa_readings[i].pressure      = safe_batch_read_name(prefab, namehash, LT.Pressure, LBM.Average)
             pa_readings[i].network_fault = safe_batch_read_name(prefab, namehash, LT.NetworkFault, LBM.Average)
         else
             pa_readings[i].pressure = nil
-            pa_readings[i].temperature = nil
-            pa_readings[i].volume = nil
             pa_readings[i].network_fault = nil
         end
+    end
+end
+
+local function refresh_pa_slow()
+    for i = 1, BOX_COUNT do
+        local device = pa_devices[i]
+        local prefab = tonumber(device.prefab) or 0
+        local namehash = tonumber(device.namehash) or 0
+        if prefab ~= 0 and namehash ~= 0 then
+            pa_readings[i].temperature = safe_batch_read_name(prefab, namehash, LT.Temperature, LBM.Average)
+            pa_readings[i].volume      = safe_batch_read_name(prefab, namehash, LT.VolumeOfLiquid, LBM.Average)
+        else
+            pa_readings[i].temperature = nil
+            pa_readings[i].volume = nil
+        end
+    end
+end
+
+local function refresh_reg_fast()
+    for i = 1, BOX_COUNT do
+        local reg = reg_devices[i]
+        local prefab = tonumber(reg.prefab) or 0
+        local namehash = tonumber(reg.namehash) or 0
+        if prefab ~= 0 and namehash ~= 0 then
+            reg_readings[i].on    = safe_batch_read_name(prefab, namehash, LT.On, LBM.Average)
+            reg_readings[i].ratio = safe_batch_read_name(prefab, namehash, LT.Ratio, LBM.Average)
+            reg_readings[i].error = safe_batch_read_name(prefab, namehash, LT.Error, LBM.Average)
+        else
+            reg_readings[i].on = nil
+            reg_readings[i].ratio = nil
+            reg_readings[i].error = nil
+        end
+    end
+end
+
+local function compute_reg_target(idx, last_state)
+    local reg = reg_devices[idx]
+    local prefab = tonumber(reg and reg.prefab) or 0
+    local readings = pa_readings[idx] or {}
+
+    if is_liquid_reg(prefab) then
+        local vol = tonumber(readings.volume)
+        local max_v = tonumber(pa_volume_max_range) or 0
+        if vol == nil or max_v <= 0 then return "off" end
+        local vol_pct = (vol / max_v) * 100
+        local on_pct  = 100 - safety_margin_pct
+        local off_pct = on_pct - HYSTERESIS_GAP_PCT
+        if off_pct < 0 then off_pct = 0 end
+        if vol_pct >= on_pct then return "on" end
+        if vol_pct <= off_pct then return "off" end
+        return last_state or "off"
+    end
+
+    local pressure = tonumber(readings.pressure)
+    if pressure == nil or pa_pressure_max_range == nil or pa_pressure_max_range <= 0 then
+        return "off"
+    end
+    if pressure >= reg_on_threshold then return "on" end
+    if pressure <= reg_off_threshold then return "off" end
+    return last_state or "off"
+end
+
+local function apply_reg_state(index, target)
+    local reg = reg_devices[index]
+    local prefab = tonumber(reg.prefab) or 0
+    local namehash = tonumber(reg.namehash) or 0
+    if prefab == 0 or namehash == 0 then return end
+    if reg_state[index] == target then return end
+    local on_value = (target == "on") and 1 or 0
+    safe_batch_write_name(prefab, namehash, LT.On, on_value)
+    reg_state[index] = target
+end
+
+local function evaluate_and_apply_reg_targets()
+    for i = 1, BOX_COUNT do
+        local reg = reg_devices[i]
+        if (tonumber(reg.prefab) or 0) ~= 0 then
+            local err = tonumber(reg_readings[i].error) or 0
+            if err < 1 then
+                local target = compute_reg_target(i, reg_state[i])
+                apply_reg_state(i, target)
+            end
+        end
+    end
+end
+
+local function push_reg_setting(index)
+    local reg = reg_devices[index]
+    local prefab = tonumber(reg.prefab) or 0
+    local namehash = tonumber(reg.namehash) or 0
+    if prefab == 0 or namehash == 0 then return end
+    local setting
+    if is_liquid_reg(prefab) then
+        -- Liquid BPR Setting is volume ratio 0-100%. Match the gas threshold shape
+        -- by pinning at (100 - safety_margin_pct) so it bleeds above the same
+        -- fraction of the tank as the gas regs do relative to max pressure.
+        setting = math.max(0, math.min(100, 100 - safety_margin_pct))
+    else
+        setting = math.min(pa_pressure_max_range, REG_SETTING_MAX)
+    end
+    safe_batch_write_name(prefab, namehash, LT.Setting, setting)
+end
+
+local function push_all_reg_settings()
+    for i = 1, BOX_COUNT do
+        push_reg_setting(i)
     end
 end
 
@@ -453,6 +663,7 @@ local function reset_handles()
         footer = {},
         overview = {},
     }
+    ui_cache_reset()
 end
 
 -- ==================== INITIALIZATION ====================
@@ -461,6 +672,8 @@ local function initialize_settings()
     for i = 1, BOX_COUNT do
         pa_devices[i].prefab = tonumber(read(MEM_PA_PREFAB_BEGIN + i - 1)) or 0
         pa_devices[i].namehash = tonumber(read(MEM_PA_NAMEHASH_BEGIN + i - 1)) or 0
+        reg_devices[i].prefab = tonumber(read(MEM_REG_PREFAB_BEGIN + i - 1)) or 0
+        reg_devices[i].namehash = tonumber(read(MEM_REG_NAMEHASH_BEGIN + i - 1)) or 0
         box_labels[i] = load_box_label(i)
     end
 
@@ -470,6 +683,11 @@ local function initialize_settings()
     if stored_ticks >= 1 then
         LIVE_REFRESH_TICKS = math.min(120, stored_ticks)
     end
+    local stored_margin = tonumber(read(MEM_SAFETY_MARGIN)) or 0
+    if stored_margin > 0 then
+        safety_margin_pct = sanitize_safety_margin(stored_margin)
+    end
+    recompute_reg_thresholds()
 end
 
 -- ==================== RENDER HELPERS ====================
@@ -513,15 +731,9 @@ end
 
 local function update_header_dynamic()
     local status_text, status_color = get_header_status()
-
-    if handles.header.status_dot ~= nil then
-        handles.header.status_dot:set_style({ bg = status_color })
-    end
-
-    if handles.header.status_label ~= nil then
-        handles.header.status_label:set_props({ text = status_text })
-        handles.header.status_label:set_style({ font_size = 11, color = status_color, align = "left" })
-    end
+    ui_set_style(handles.header.status_dot, { bg = status_color })
+    ui_set_props(handles.header.status_label, { text = status_text })
+    ui_set_style(handles.header.status_label, { font_size = 11, color = status_color, align = "left" })
 end
 
 local function render_nav_tabs()
@@ -584,40 +796,30 @@ local function render_footer()
 end
 
 local function update_nav_dynamic()
-    if handles.nav.overview ~= nil then
-        local active = view == "overview"
-        handles.nav.overview:set_style({
-            bg = active and "#6844aa" or "#333344",
-            text = "#FFFFFF",
-            font_size = 11,
-            gradient = active and "#3b1f88" or "#1c1c2e",
-            gradient_dir = "vertical"
-        })
-    end
-
-    if handles.nav.settings ~= nil then
-        local active = view == "settings"
-        handles.nav.settings:set_style({
-            bg = active and "#6844aa" or "#333344",
-            text = "#FFFFFF",
-            font_size = 11,
-            gradient = active and "#3b1f88" or "#1c1c2e",
-            gradient_dir = "vertical"
-        })
-    end
+    local active_ov = (view == "overview")
+    ui_set_style(handles.nav.overview, {
+        bg = active_ov and "#6844aa" or "#333344",
+        text = "#FFFFFF",
+        font_size = 11,
+        gradient = active_ov and "#3b1f88" or "#1c1c2e",
+        gradient_dir = "vertical"
+    })
+    local active_set = (view == "settings")
+    ui_set_style(handles.nav.settings, {
+        bg = active_set and "#6844aa" or "#333344",
+        text = "#FFFFFF",
+        font_size = 11,
+        gradient = active_set and "#3b1f88" or "#1c1c2e",
+        gradient_dir = "vertical"
+    })
 end
 
 local function update_footer_dynamic()
     local gt = util.game_time()
     local gtH = math.floor(gt / 3600)
     local gtM = math.floor((gt % 3600) / 60)
-
-    if handles.footer.left ~= nil then
-        handles.footer.left:set_props({ text = "Time: " .. currenttime })
-    end
-    if handles.footer.right ~= nil then
-        handles.footer.right:set_props({ text = string.format("Tick %.0f | ELAPSED %dh %02dm", math.floor(elapsed), gtH, gtM) })
-    end
+    ui_set_props(handles.footer.left, { text = "Time: " .. currenttime })
+    ui_set_props(handles.footer.right, { text = string.format("Tick %.0f | ELAPSED %dh %02dm", math.floor(elapsed), gtH, gtM) })
 end
 
 -- ==================== OVERVIEW (12 BOXES) ====================
@@ -626,12 +828,18 @@ local function render_overview_box(idx, x, y, w, h)
     local r = pa_readings[idx]
     local p_pct = bar_percent(r.pressure, pa_pressure_max_range)
     local v_pct = bar_percent(r.volume, pa_volume_max_range)
-    local temp_label_y = y + 15
-    local temp_value_y = y + 23
-    local pressure_row_y = y + 34
-    local pressure_bar_y = y + 43
-    local volume_row_y = y + 51
-    local volume_bar_y = y + 60
+    -- Scale row spacing and bar thickness with box height. sf=1 at h=90 (matches
+    -- the original layout); sf=2 at h=180 so content fills tall boxes.
+    local sf = h / 90
+    if sf < 1 then sf = 1 end
+    local temp_label_y = y + math.floor(15 * sf)
+    local temp_value_y = y + math.floor(23 * sf)
+    local pressure_row_y = y + math.floor(34 * sf)
+    local pressure_bar_y = y + math.floor(43 * sf)
+    local volume_row_y = y + math.floor(51 * sf)
+    local volume_bar_y = y + math.floor(60 * sf)
+    local reg_row_y = y + math.floor(69 * sf)
+    local bar_h = math.max(5, math.floor(5 * sf))
 
     s:element({
         id = "box_" .. idx .. "_bg",
@@ -683,14 +891,14 @@ local function render_overview_box(idx, x, y, w, h)
     s:element({
         id = "box_" .. idx .. "_p_bar_bg",
         type = "panel",
-        rect = { unit = "px", x = x + 6, y = pressure_bar_y, w = w - 12, h = 5 },
+        rect = { unit = "px", x = x + 6, y = pressure_bar_y, w = w - 12, h = bar_h },
         style = { bg = C.bar_bg }
     })
 
     handles.overview["box_" .. idx .. "_p_bar_fill"] = s:element({
         id = "box_" .. idx .. "_p_bar_fill",
         type = "panel",
-        rect = { unit = "px", x = x + 6, y = pressure_bar_y, w = math.max(1, math.floor((w - 12) * p_pct / 100)), h = 5 },
+        rect = { unit = "px", x = x + 6, y = pressure_bar_y, w = math.max(1, math.floor((w - 12) * p_pct / 100)), h = bar_h },
         style = { bg = pressure_value_color(r.pressure) }
     })
 
@@ -713,64 +921,112 @@ local function render_overview_box(idx, x, y, w, h)
     s:element({
         id = "box_" .. idx .. "_v_bar_bg",
         type = "panel",
-        rect = { unit = "px", x = x + 6, y = volume_bar_y, w = w - 12, h = 5 },
+        rect = { unit = "px", x = x + 6, y = volume_bar_y, w = w - 12, h = bar_h },
         style = { bg = C.bar_bg }
     })
 
     handles.overview["box_" .. idx .. "_v_bar_fill"] = s:element({
         id = "box_" .. idx .. "_v_bar_fill",
         type = "panel",
-        rect = { unit = "px", x = x + 6, y = volume_bar_y, w = math.max(1, math.floor((w - 12) * v_pct / 100)), h = 5 },
+        rect = { unit = "px", x = x + 6, y = volume_bar_y, w = math.max(1, math.floor((w - 12) * v_pct / 100)), h = bar_h },
         style = { bg = volume_value_color(r.volume) }
     })
+
+    local reg_text, reg_color = reg_status_for_box(idx)
+
+    s:element({
+        id = "box_" .. idx .. "_reg_label",
+        type = "label",
+        rect = { unit = "px", x = x + 6, y = reg_row_y, w = 30, h = 8 },
+        props = { text = "BPR" },
+        style = { font_size = 6, color = C.text_dim, align = "left" }
+    })
+
+    handles.overview["box_" .. idx .. "_reg_value"] = s:element({
+        id = "box_" .. idx .. "_reg_value",
+        type = "label",
+        rect = { unit = "px", x = x + 38, y = reg_row_y, w = w - 44, h = 8 },
+        props = { text = reg_text },
+        style = { font_size = 7, color = reg_color, align = "left" }
+    })
 end
+
+local MAX_BOX_W = 240
+local MAX_BOX_H = 180
 
 local function render_overview()
     local top = 58
     local bottom = H - 22
     local left = 6
     local right = W - 6
-    local cols = 3
-    local rows = 4
     local gap_x = 6
     local gap_y = 6
 
+    local configured = {}
+    for i = 1, BOX_COUNT do
+        if (tonumber(pa_devices[i].prefab) or 0) ~= 0 then
+            table.insert(configured, i)
+        end
+    end
+
+    if #configured == 0 then
+        s:element({
+            id = "overview_empty",
+            type = "label",
+            rect = { unit = "px", x = left, y = top + math.floor((bottom - top) / 2) - 8, w = right - left, h = 16 },
+            props = { text = "Assign a Pipe Analyzer in Settings > PA" },
+            style = { font_size = 10, color = C.text_dim, align = "center" }
+        })
+        return
+    end
+
+    local count = #configured
+    local cols = math.min(3, count)
+    local rows = math.ceil(count / cols)
     local grid_w = right - left
     local grid_h = bottom - top
-    local box_w = math.floor((grid_w - gap_x * (cols - 1)) / cols)
-    local box_h = math.floor((grid_h - gap_y * (rows - 1)) / rows)
+    local natural_w = math.floor((grid_w - gap_x * (cols - 1)) / cols)
+    local natural_h = math.floor((grid_h - gap_y * (rows - 1)) / rows)
+    local box_w = math.min(MAX_BOX_W, natural_w)
+    local box_h = math.min(MAX_BOX_H, natural_h)
 
-    local idx = 1
-    for r = 0, rows - 1 do
-        for c = 0, cols - 1 do
-            local x = left + c * (box_w + gap_x)
-            local y = top + r * (box_h + gap_y)
-            render_overview_box(idx, x, y, box_w, box_h)
-            idx = idx + 1
-        end
+    for pos = 1, count do
+        local idx = configured[pos]
+        local c = (pos - 1) % cols
+        local r = math.floor((pos - 1) / cols)
+        local x = left + c * (box_w + gap_x)
+        local y = top + r * (box_h + gap_y)
+        render_overview_box(idx, x, y, box_w, box_h)
     end
 end
 
 local function update_overview_dynamic()
     for idx = 1, BOX_COUNT do
         local r = pa_readings[idx]
-
-        if handles.overview["box_" .. idx .. "_label"] ~= nil then
-            handles.overview["box_" .. idx .. "_label"]:set_props({ text = box_labels[idx] })
-        end
-        if handles.overview["box_" .. idx .. "_p_value"] ~= nil then
-            handles.overview["box_" .. idx .. "_p_value"]:set_props({ text = format_pressure_label(r.pressure) .. " [" .. percent_text(r.pressure, pa_pressure_max_range) .. "]" })
-            handles.overview["box_" .. idx .. "_p_value"]:set_style({ font_size = 7, color = pressure_value_color(r.pressure), align = "left" })
-        end
-        if handles.overview["box_" .. idx .. "_v_value"] ~= nil then
-            handles.overview["box_" .. idx .. "_v_value"]:set_props({ text = format_volume_label(r.volume) .. " [" .. percent_text(r.volume, pa_volume_max_range) .. "]" })
-            handles.overview["box_" .. idx .. "_v_value"]:set_style({ font_size = 7, color = volume_value_color(r.volume), align = "left" })
-        end
-        if handles.overview["box_" .. idx .. "_t_value"] ~= nil then
-            handles.overview["box_" .. idx .. "_t_value"]:set_props({ text = format_temperature_label(r.temperature) })
-            handles.overview["box_" .. idx .. "_t_value"]:set_style({ font_size = 7, color = temperature_value_color(r.temperature), align = "center" })
-        end
-
+        ui_set_props(handles.overview["box_" .. idx .. "_label"], { text = box_labels[idx] })
+        ui_set_props(handles.overview["box_" .. idx .. "_p_value"], {
+            text = format_pressure_label(r.pressure) .. " [" .. percent_text(r.pressure, pa_pressure_max_range) .. "]"
+        })
+        ui_set_style(handles.overview["box_" .. idx .. "_p_value"], {
+            font_size = 7, color = pressure_value_color(r.pressure), align = "left"
+        })
+        ui_set_props(handles.overview["box_" .. idx .. "_v_value"], {
+            text = format_volume_label(r.volume) .. " [" .. percent_text(r.volume, pa_volume_max_range) .. "]"
+        })
+        ui_set_style(handles.overview["box_" .. idx .. "_v_value"], {
+            font_size = 7, color = volume_value_color(r.volume), align = "left"
+        })
+        ui_set_props(handles.overview["box_" .. idx .. "_t_value"], {
+            text = format_temperature_label(r.temperature)
+        })
+        ui_set_style(handles.overview["box_" .. idx .. "_t_value"], {
+            font_size = 7, color = temperature_value_color(r.temperature), align = "center"
+        })
+        local reg_text, reg_color = reg_status_for_box(idx)
+        ui_set_props(handles.overview["box_" .. idx .. "_reg_value"], { text = reg_text })
+        ui_set_style(handles.overview["box_" .. idx .. "_reg_value"], {
+            font_size = 7, color = reg_color, align = "left"
+        })
     end
 end
 
@@ -783,12 +1039,13 @@ local function render_settings()
     local panel_w = W - 16
     local panel_h = H - content_y - 22
     local tab_y = panel_y + 8
-    local tab_w = math.floor((panel_w - 14) / 2)
+    local tab_w = math.floor((panel_w - 14) / 3)
 
     local function render_settings_subtabs()
         local tabs = {
             { id = "settings_labels", text = "LABELS", key = "labels" },
             { id = "settings_pa", text = "PA", key = "pa" },
+            { id = "settings_reg", text = "BPR", key = "reg" },
         }
 
         for index, tab in ipairs(tabs) do
@@ -850,7 +1107,114 @@ local function render_settings()
         end
     end
 
+    local function render_pa_picker(base_y, idx)
+        s:element({
+            id = "pa_picker_back",
+            type = "button",
+            rect = { unit = "px", x = panel_x + 14, y = base_y, w = 70, h = 20 },
+            props = { text = "< Back" },
+            style = {
+                bg = C.panel_light, text = C.text, font_size = 9,
+                gradient = "#182133", gradient_dir = "vertical", align = "center"
+            },
+            on_click = function()
+                pa_picker_idx = nil
+                dashboard_render(true)
+            end
+        })
+
+        s:element({
+            id = "pa_picker_title",
+            type = "label",
+            rect = { unit = "px", x = panel_x + 96, y = base_y + 3, w = panel_w - 110, h = 16 },
+            props = { text = "Select Pipe Analyzer for PA Box " .. idx },
+            style = { font_size = 10, color = C.accent, align = "left" }
+        })
+
+        local list_y = base_y + 28
+        local list_h = panel_y + panel_h - list_y - 6
+        if list_h < 40 then list_h = 40 end
+
+        local devs = device_list_safe()
+        local candidates = {}
+        for _, dev in ipairs(devs) do
+            if device_matches_prefabs(dev, { PA_PREFAB_FILTERS.gas, PA_PREFAB_FILTERS.liquid }) then
+                table.insert(candidates, dev)
+            end
+        end
+
+        local row_h = 22
+        local content_height = math.max(list_h, (#candidates + 1) * row_h + 8)
+
+        local scroll = s:element({
+            id = "pa_picker_scroll",
+            type = "scrollview",
+            rect = { unit = "px", x = panel_x + 14, y = list_y, w = panel_w - 28, h = list_h },
+            props = { content_height = tostring(content_height) },
+            style = { bg = C.panel, scrollbar_bg = C.panel_light, scrollbar_handle = C.accent }
+        })
+
+        local inner_w = panel_w - 48
+        local current_p = tonumber(pa_devices[idx].prefab) or 0
+        local current_n = tonumber(pa_devices[idx].namehash) or 0
+        local unassigned = (current_p == 0 and current_n == 0)
+
+        scroll:element({
+            id = "pa_picker_unassign",
+            type = "button",
+            rect = { unit = "px", x = 6, y = 4, w = inner_w - 12, h = row_h - 4 },
+            props = { text = (unassigned and "> " or "   ") .. "(Unassigned)" },
+            style = {
+                bg = unassigned and C.accent or C.panel_light,
+                text = unassigned and C.bg or C.text_dim,
+                font_size = 9,
+                gradient = unassigned and "#0f4c63" or "#182133",
+                gradient_dir = "vertical", align = "left"
+            },
+            on_click = function()
+                pa_devices[idx].prefab = 0
+                pa_devices[idx].namehash = 0
+                save_pa_state(idx)
+                pa_picker_idx = nil
+                dashboard_render(true)
+            end
+        })
+
+        for i, dev in ipairs(candidates) do
+            local label = tostring((dev and dev.display_name) or ("Device " .. i))
+            local dev_p = tonumber(dev.prefab_hash) or 0
+            local dev_n = tonumber(dev.name_hash) or 0
+            local selected = (current_p == dev_p and current_n == dev_n)
+            local picked_ref = dev
+            scroll:element({
+                id = "pa_picker_row_" .. i,
+                type = "button",
+                rect = { unit = "px", x = 6, y = i * row_h + 4, w = inner_w - 12, h = row_h - 4 },
+                props = { text = (selected and "> " or "   ") .. label },
+                style = {
+                    bg = selected and C.accent or C.panel_light,
+                    text = selected and C.bg or C.text,
+                    font_size = 9,
+                    gradient = selected and "#0f4c63" or "#182133",
+                    gradient_dir = "vertical", align = "left"
+                },
+                on_click = function()
+                    pa_devices[idx].prefab = tonumber(picked_ref.prefab_hash) or 0
+                    pa_devices[idx].namehash = tonumber(picked_ref.name_hash) or 0
+                    save_pa_state(idx)
+                    pa_picker_idx = nil
+                    dashboard_render(true)
+                end
+            })
+        end
+    end
+
     local function render_pa_subview(base_y)
+        if pa_picker_idx ~= nil then
+            render_pa_picker(base_y, pa_picker_idx)
+            return
+        end
+
         s:element({
             id = "settings_title",
             type = "label",
@@ -875,6 +1239,9 @@ local function render_settings()
             on_change = function(new_value)
                 pa_pressure_max_range = sanitize_max_range(new_value, pa_pressure_max_range)
                 save_pa_ranges()
+                recompute_reg_thresholds()
+                push_all_reg_settings()
+                dashboard_render(true)
             end
         })
 
@@ -894,6 +1261,7 @@ local function render_settings()
             on_change = function(new_value)
                 pa_volume_max_range = sanitize_max_range(new_value, pa_volume_max_range)
                 save_pa_ranges()
+                dashboard_render(true)
             end
         })
 
@@ -914,112 +1282,350 @@ local function render_settings()
                 local n = math.max(1, math.min(120, tonumber(new_value) or LIVE_REFRESH_TICKS))
                 LIVE_REFRESH_TICKS = n
                 write(MEM_REFRESH_TICKS, n)
+                dashboard_render(true)
             end
         })
 
-        local start_idx = pa_settings_page == 1 and 1 or 7
-        local end_idx = math.min(start_idx + 5, BOX_COUNT)
+        local list_y = base_y + 48
+        local list_h = panel_y + panel_h - list_y - 6
+        if list_h < 40 then list_h = 40 end
 
-        for i = start_idx, end_idx do
+        local row_h = 22
+        local content_height = math.max(list_h, BOX_COUNT * row_h + 8)
+
+        local scroll = s:element({
+            id = "pa_list_scroll",
+            type = "scrollview",
+            rect = { unit = "px", x = panel_x + 14, y = list_y, w = panel_w - 28, h = list_h },
+            props = { content_height = tostring(content_height) },
+            style = { bg = C.panel, scrollbar_bg = C.panel_light, scrollbar_handle = C.accent }
+        })
+
+        local inner_w = panel_w - 48
+        local change_w = 58
+        local clear_w = 48
+        local name_x = 82
+        local name_w = inner_w - name_x - change_w - clear_w - 20
+        if name_w < 40 then name_w = 40 end
+        local change_x = name_x + name_w + 4
+        local clear_x = change_x + change_w + 4
+
+        local devs = device_list_safe()
+
+        for i = 1, BOX_COUNT do
             local idx = i
-            local row = i - start_idx
-            local row_y = base_y + 48 + row * 23
-            local col_x = panel_x + 14
-
-            if cached_tso_dropdowns == nil then
-                populate_tso_dropdown_cache()
+            local y = (i - 1) * row_h + 4
+            local p = tonumber(pa_devices[idx].prefab) or 0
+            local n = tonumber(pa_devices[idx].namehash) or 0
+            local bound = (p ~= 0 and n ~= 0)
+            local device_label = "--"
+            if bound then
+                for _, dev in ipairs(devs) do
+                    if (tonumber(dev.prefab_hash) or 0) == p and (tonumber(dev.name_hash) or 0) == n then
+                        device_label = tostring(dev.display_name or device_label)
+                        break
+                    end
+                end
             end
-            local cache_entry = cached_tso_dropdowns[idx] or { opts = { "Select device..." }, candidates = {}, selected = 0 }
-            local options = cache_entry.opts
-            local row_candidates = cache_entry.candidates
-            pa_dropdown_selected[idx] = cache_entry.selected
 
-            s:element({
-                id = "pa_" .. i .. "_header",
+            scroll:element({
+                id = "pa_list_hdr_" .. i,
                 type = "label",
-                rect = { unit = "px", x = col_x, y = row_y + 2, w = 70, h = 14 },
+                rect = { unit = "px", x = 6, y = y + 3, w = 72, h = 16 },
                 props = { text = "PA Box " .. i },
-                style = { font_size = 8, color = C.text, align = "left" }
+                style = { font_size = 9, color = C.text, align = "left" }
             })
 
-            s:element({
-                id = "pa_" .. i .. "_dropdown",
-                type = "select",
-                rect = { unit = "px", x = col_x + 70, y = row_y, w = 300, h = 20 },
-                props = {
-                    options = table.concat(options, "|"),
-                    selected = pa_dropdown_selected[idx],
-                    open = pa_dropdown_open[idx],
-                },
-                on_toggle = function()
-                    if cached_tso_dropdowns == nil then
-                        populate_tso_dropdown_cache()
-                    end
-                    pa_dropdown_open[idx] = pa_dropdown_open[idx] == "true" and "false" or "true"
-                    dashboard_render(true)
-                end,
-                on_change = function(optionIndex)
-                    local selected_option = tonumber(optionIndex) or 0
-                    pa_dropdown_selected[idx] = selected_option
-                    if cached_tso_dropdowns and cached_tso_dropdowns[idx] then
-                        cached_tso_dropdowns[idx].selected = selected_option
-                    end
-                    pa_dropdown_open[idx] = "false"
+            scroll:element({
+                id = "pa_list_name_" .. i,
+                type = "label",
+                rect = { unit = "px", x = name_x, y = y + 3, w = name_w, h = 16 },
+                props = { text = device_label },
+                style = { font_size = 9, color = bound and C.text or C.text_dim, align = "left" }
+            })
 
-                    if selected_option == 0 then
+            scroll:element({
+                id = "pa_list_change_" .. i,
+                type = "button",
+                rect = { unit = "px", x = change_x, y = y, w = change_w, h = row_h - 4 },
+                props = { text = "Change" },
+                style = {
+                    bg = C.panel_light, text = C.text, font_size = 8,
+                    gradient = "#182133", gradient_dir = "vertical", align = "center"
+                },
+                on_click = function()
+                    pa_picker_idx = idx
+                    dashboard_render(true)
+                end
+            })
+
+            if bound then
+                scroll:element({
+                    id = "pa_list_clear_" .. i,
+                    type = "button",
+                    rect = { unit = "px", x = clear_x, y = y, w = clear_w, h = row_h - 4 },
+                    props = { text = "Clear" },
+                    style = {
+                        bg = C.panel_light, text = C.red, font_size = 8,
+                        gradient = "#182133", gradient_dir = "vertical", align = "center"
+                    },
+                    on_click = function()
                         pa_devices[idx].prefab = 0
                         pa_devices[idx].namehash = 0
-                    else
-                        local picked = row_candidates[selected_option]
-                        if picked ~= nil then
-                            pa_devices[idx].prefab = tonumber(picked.prefab_hash) or 0
-                            pa_devices[idx].namehash = tonumber(picked.name_hash) or 0
-                        end
+                        save_pa_state(idx)
+                        dashboard_render(true)
                     end
+                })
+            end
+        end
+    end
 
-                    save_pa_state(idx)
+    local function render_reg_picker(base_y, idx)
+        s:element({
+            id = "reg_picker_back",
+            type = "button",
+            rect = { unit = "px", x = panel_x + 14, y = base_y, w = 70, h = 20 },
+            props = { text = "< Back" },
+            style = {
+                bg = C.panel_light, text = C.text, font_size = 9,
+                gradient = "#182133", gradient_dir = "vertical", align = "center"
+            },
+            on_click = function()
+                reg_picker_idx = nil
+                dashboard_render(true)
+            end
+        })
+
+        s:element({
+            id = "reg_picker_title",
+            type = "label",
+            rect = { unit = "px", x = panel_x + 96, y = base_y + 3, w = panel_w - 110, h = 16 },
+            props = { text = "Select Regulator for BPR Box " .. idx },
+            style = { font_size = 10, color = C.accent, align = "left" }
+        })
+
+        local list_y = base_y + 28
+        local list_h = panel_y + panel_h - list_y - 6
+        if list_h < 40 then list_h = 40 end
+
+        local devs = device_list_safe()
+        local candidates = {}
+        for _, dev in ipairs(devs) do
+            if device_matches_prefabs(dev, {
+                REG_PREFAB_FILTERS.vanilla,
+                REG_PREFAB_FILTERS.mirrored,
+                REG_PREFAB_FILTERS.liquid_vanilla,
+                REG_PREFAB_FILTERS.liquid_mirrored,
+            }) then
+                table.insert(candidates, dev)
+            end
+        end
+
+        local row_h = 22
+        local content_height = math.max(list_h, (#candidates + 1) * row_h + 8)
+
+        local scroll = s:element({
+            id = "reg_picker_scroll",
+            type = "scrollview",
+            rect = { unit = "px", x = panel_x + 14, y = list_y, w = panel_w - 28, h = list_h },
+            props = { content_height = tostring(content_height) },
+            style = { bg = C.panel, scrollbar_bg = C.panel_light, scrollbar_handle = C.accent }
+        })
+
+        local inner_w = panel_w - 48
+        local current_p = tonumber(reg_devices[idx].prefab) or 0
+        local current_n = tonumber(reg_devices[idx].namehash) or 0
+        local unassigned = (current_p == 0 and current_n == 0)
+
+        scroll:element({
+            id = "reg_picker_unassign",
+            type = "button",
+            rect = { unit = "px", x = 6, y = 4, w = inner_w - 12, h = row_h - 4 },
+            props = { text = (unassigned and "> " or "   ") .. "(Unassigned)" },
+            style = {
+                bg = unassigned and C.accent or C.panel_light,
+                text = unassigned and C.bg or C.text_dim,
+                font_size = 9,
+                gradient = unassigned and "#0f4c63" or "#182133",
+                gradient_dir = "vertical", align = "left"
+            },
+            on_click = function()
+                reg_devices[idx].prefab = 0
+                reg_devices[idx].namehash = 0
+                save_reg_state(idx)
+                reg_state[idx] = "off"
+                reg_picker_idx = nil
+                dashboard_render(true)
+            end
+        })
+
+        for i, dev in ipairs(candidates) do
+            local label = tostring((dev and dev.display_name) or ("Device " .. i))
+            local dev_p = tonumber(dev.prefab_hash) or 0
+            local dev_n = tonumber(dev.name_hash) or 0
+            local selected = (current_p == dev_p and current_n == dev_n)
+            local picked_ref = dev
+            scroll:element({
+                id = "reg_picker_row_" .. i,
+                type = "button",
+                rect = { unit = "px", x = 6, y = i * row_h + 4, w = inner_w - 12, h = row_h - 4 },
+                props = { text = (selected and "> " or "   ") .. label },
+                style = {
+                    bg = selected and C.accent or C.panel_light,
+                    text = selected and C.bg or C.text,
+                    font_size = 9,
+                    gradient = selected and "#0f4c63" or "#182133",
+                    gradient_dir = "vertical", align = "left"
+                },
+                on_click = function()
+                    reg_devices[idx].prefab = tonumber(picked_ref.prefab_hash) or 0
+                    reg_devices[idx].namehash = tonumber(picked_ref.name_hash) or 0
+                    save_reg_state(idx)
+                    reg_state[idx] = "off"
+                    push_reg_setting(idx)
+                    reg_picker_idx = nil
                     dashboard_render(true)
                 end
             })
         end
+    end
 
-        local page_button_y = base_y + 48 + (math.min(6, end_idx - start_idx + 1) * 23) + 4
+    local function render_reg_subview(base_y)
+        if reg_picker_idx ~= nil then
+            render_reg_picker(base_y, reg_picker_idx)
+            return
+        end
 
         s:element({
-            id = "pa_page_1_btn",
-            type = "button",
-            rect = { unit = "px", x = panel_x + 172, y = page_button_y, w = 56, h = 20 },
-            props = { text = "1-6" },
-            style = {
-                bg = pa_settings_page == 1 and C.accent or C.panel_light,
-                text = pa_settings_page == 1 and C.bg or C.text,
-                font_size = 8,
-                gradient = pa_settings_page == 1 and "#0f4c63" or "#182133",
-                gradient_dir = "vertical"
-            },
-            on_click = function()
-                pa_settings_page = 1
+            id = "settings_title",
+            type = "label",
+            rect = { unit = "px", x = panel_x + 14, y = base_y, w = panel_w - 28, h = 14 },
+            props = { text = "Back Pressure Regulator Assignment" },
+            style = { font_size = 10, color = C.accent, align = "left" }
+        })
+
+        s:element({
+            id = "safety_margin_label",
+            type = "label",
+            rect = { unit = "px", x = panel_x + 14, y = base_y + 20, w = 110, h = 14 },
+            props = { text = "Safety Margin %" },
+            style = { font_size = 8, color = C.text, align = "left" }
+        })
+
+        s:element({
+            id = "safety_margin_input",
+            type = "textinput",
+            rect = { unit = "px", x = panel_x + 124, y = base_y + 18, w = 60, h = 20 },
+            props = { value = tostring(safety_margin_pct), placeholder = "10" },
+            on_change = function(new_value)
+                safety_margin_pct = sanitize_safety_margin(new_value)
+                save_safety_margin()
+                push_all_reg_settings()
                 dashboard_render(true)
             end
         })
 
         s:element({
-            id = "pa_page_2_btn",
-            type = "button",
-            rect = { unit = "px", x = panel_x + 236, y = page_button_y, w = 56, h = 20 },
-            props = { text = "7-12" },
-            style = {
-                bg = pa_settings_page == 2 and C.accent or C.panel_light,
-                text = pa_settings_page == 2 and C.bg or C.text,
-                font_size = 8,
-                gradient = pa_settings_page == 2 and "#0f4c63" or "#182133",
-                gradient_dir = "vertical"
-            },
-            on_click = function()
-                pa_settings_page = 2
-                dashboard_render(true)
-            end
+            id = "safety_margin_hint",
+            type = "label",
+            rect = { unit = "px", x = panel_x + 192, y = base_y + 20, w = panel_w - 206, h = 14 },
+            props = { text = string.format("On >= %.0f kPa | Off < %.0f kPa", reg_on_threshold, reg_off_threshold) },
+            style = { font_size = 7, color = C.text_dim, align = "left" }
         })
+
+        local list_y = base_y + 48
+        local list_h = panel_y + panel_h - list_y - 6
+        if list_h < 40 then list_h = 40 end
+
+        local row_h = 22
+        local content_height = math.max(list_h, BOX_COUNT * row_h + 8)
+
+        local scroll = s:element({
+            id = "reg_list_scroll",
+            type = "scrollview",
+            rect = { unit = "px", x = panel_x + 14, y = list_y, w = panel_w - 28, h = list_h },
+            props = { content_height = tostring(content_height) },
+            style = { bg = C.panel, scrollbar_bg = C.panel_light, scrollbar_handle = C.accent }
+        })
+
+        local inner_w = panel_w - 48
+        local change_w = 58
+        local clear_w = 48
+        local name_x = 82
+        local name_w = inner_w - name_x - change_w - clear_w - 20
+        if name_w < 40 then name_w = 40 end
+        local change_x = name_x + name_w + 4
+        local clear_x = change_x + change_w + 4
+
+        local devs = device_list_safe()
+
+        for i = 1, BOX_COUNT do
+            local idx = i
+            local y = (i - 1) * row_h + 4
+            local p = tonumber(reg_devices[idx].prefab) or 0
+            local n = tonumber(reg_devices[idx].namehash) or 0
+            local bound = (p ~= 0 and n ~= 0)
+            local device_label = "--"
+            if bound then
+                for _, dev in ipairs(devs) do
+                    if (tonumber(dev.prefab_hash) or 0) == p and (tonumber(dev.name_hash) or 0) == n then
+                        device_label = tostring(dev.display_name or device_label)
+                        break
+                    end
+                end
+            end
+
+            scroll:element({
+                id = "reg_list_hdr_" .. i,
+                type = "label",
+                rect = { unit = "px", x = 6, y = y + 3, w = 72, h = 16 },
+                props = { text = "BPR Box " .. i },
+                style = { font_size = 9, color = C.text, align = "left" }
+            })
+
+            scroll:element({
+                id = "reg_list_name_" .. i,
+                type = "label",
+                rect = { unit = "px", x = name_x, y = y + 3, w = name_w, h = 16 },
+                props = { text = device_label },
+                style = { font_size = 9, color = bound and C.text or C.text_dim, align = "left" }
+            })
+
+            scroll:element({
+                id = "reg_list_change_" .. i,
+                type = "button",
+                rect = { unit = "px", x = change_x, y = y, w = change_w, h = row_h - 4 },
+                props = { text = "Change" },
+                style = {
+                    bg = C.panel_light, text = C.text, font_size = 8,
+                    gradient = "#182133", gradient_dir = "vertical", align = "center"
+                },
+                on_click = function()
+                    reg_picker_idx = idx
+                    dashboard_render(true)
+                end
+            })
+
+            if bound then
+                scroll:element({
+                    id = "reg_list_clear_" .. i,
+                    type = "button",
+                    rect = { unit = "px", x = clear_x, y = y, w = clear_w, h = row_h - 4 },
+                    props = { text = "Clear" },
+                    style = {
+                        bg = C.panel_light, text = C.red, font_size = 8,
+                        gradient = "#182133", gradient_dir = "vertical", align = "center"
+                    },
+                    on_click = function()
+                        reg_devices[idx].prefab = 0
+                        reg_devices[idx].namehash = 0
+                        save_reg_state(idx)
+                        reg_state[idx] = "off"
+                        dashboard_render(true)
+                    end
+                })
+            end
+        end
     end
 
     s:element({
@@ -1034,6 +1640,8 @@ local function render_settings()
     local subview_y = tab_y + 28
     if settings_subview == "labels" then
         render_labels_subview(subview_y)
+    elseif settings_subview == "reg" then
+        render_reg_subview(subview_y)
     else
         render_pa_subview(subview_y)
     end
@@ -1049,10 +1657,6 @@ dashboard_render = function(force_rebuild)
     local desired = view or "overview"
     if surfaces[desired] == nil then desired = "overview" end
     s = surfaces[desired]
-
-    if desired == "overview" then
-        refresh_pa_readings()
-    end
 
     if force_rebuild or handles.view ~= desired then
         s:clear()
@@ -1109,8 +1713,10 @@ function serialize()
         settings_subview = settings_subview,
         box_labels = box_labels,
         pa_devices = pa_devices,
+        reg_devices = reg_devices,
         pa_pressure_max_range = pa_pressure_max_range,
         pa_volume_max_range = pa_volume_max_range,
+        safety_margin_pct = safety_margin_pct,
     }
     local ok, json = pcall(util.json.encode, state)
     if not ok then return nil end
@@ -1147,27 +1753,58 @@ function deserialize(blob)
         end
     end
 
+    if type(decoded.reg_devices) == "table" then
+        for i = 1, BOX_COUNT do
+            local item = decoded.reg_devices[i]
+            if type(item) == "table" then
+                reg_devices[i].prefab = tonumber(item.prefab) or reg_devices[i].prefab
+                reg_devices[i].namehash = tonumber(item.namehash) or reg_devices[i].namehash
+                save_reg_state(i)
+            end
+        end
+    end
+
     pa_pressure_max_range = sanitize_max_range(decoded.pa_pressure_max_range, pa_pressure_max_range)
     pa_volume_max_range = sanitize_max_range(decoded.pa_volume_max_range, pa_volume_max_range)
+    if decoded.safety_margin_pct ~= nil then
+        safety_margin_pct = sanitize_safety_margin(decoded.safety_margin_pct)
+    end
     save_pa_ranges()
+    save_safety_margin()
 end
 
 -- ==================== BOOT ====================
 
 initialize_settings()
-populate_tso_dropdown_cache()
+push_all_reg_settings()
 set_view(view)
 
 -- ==================== MAIN LOOP ====================
 
 local tick = 0
+local resync_counter = 0
+local RESYNC_EVERY = 60
+
 while true do
     tick = tick + 1
     elapsed = elapsed + 1
     currenttime = util.clock_time()
 
+    refresh_pa_fast()
+    refresh_reg_fast()
+    evaluate_and_apply_reg_targets()
+    update_header_dynamic()
+
     if tick % LIVE_REFRESH_TICKS == 0 then
+        refresh_pa_slow()
+        resync_counter = resync_counter + 1
+        if resync_counter >= RESYNC_EVERY then
+            resync_counter = 0
+            push_all_reg_settings()
+        end
         if view == "overview" then
+            -- Full rebuild so bar widths reflect fresh readings; update_overview_dynamic
+            -- only touches text/style, not element geometry.
             dashboard_render(true)
         end
     end
